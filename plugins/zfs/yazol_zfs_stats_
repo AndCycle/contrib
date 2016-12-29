@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+
+: << =cut
+
+=head1 NAME
+
+yazol_zfs_stats_
+
+yet another attempt to make a munin plugin for ZFSonLinux
+
+=head1 !!!WARNING!!!
+
+work base on ZoL 0.7.0
+
+I know there has been lot's of ZFS plugin there
+but I need to reinvent the wheel as the number is so wrong in some place
+
+plus mine touched a bug at munin-2.0.28 and below
+https://github.com/munin-monitoring/munin/issues/762
+
+so this shall not be a standard version as it currently only work on my machine.
+
+I wrote this plugin base on lot's  of code from many people, thanks for their work
+
+=over
+
+=item arc_summery.py - $Id: arc_summary.pl,v 388:e27800740aa2 2011-07-08 02:53:29Z jhell $
+
+=item zfs_stats_ - Author: David Bjornsson <dabb@lolnet.is>
+
+=item zfsonlinux_stats_ - # Author: Adam Michel (elfurbe@furbism.com)
+
+=item lookup "/module/zfs/arc.c" for actual definition
+
+=back
+
+=head1 MAGIC MARKERS
+
+ #%# family=auto contrib
+ #%# capabilities=autoconf suggest
+
+
+=cut
+
+. $MUNIN_LIBDIR/plugins/plugin.sh
+
+ARCSTATS_PATH="/proc/spl/kstat/zfs/arcstats"
+
+declare -A ARCSTATS
+
+main() {
+
+    MUNIN_ARG="$1"
+    TARGET=$(basename $0 | cut -d_ -f4-)
+    parse_arcstats
+
+    if [ -z "$TARGET" ] && [ ! -z "$MUNIN_ARG" ]; then
+        case "$MUNIN_ARG" in
+            autoconf)
+                if ((BASH_VERSINFO[0] < 4)); then
+                    echo no \(req. Bash Version 4 and above\)
+                    exit
+                fi
+                if [ ! -r "$ARCSTATS_PATH" ]; then
+                    echo no \("$ARCSTATS_PATH" is not readable\)
+                fi
+                echo yes
+                ;;
+            suggest)
+                if [  -r "$ARCSTATS_PATH" ]; then
+                    t=("efficiency" "hits_bylist hits_bytype misses_bytype")
+                    for i in ${t[@]}
+                    do
+                        for j in "pct" "cnt"
+                        do
+                            echo "$i"_"$j"
+                        done
+                    done
+                    echo arc_size
+                    echo arc_size_breakdown
+                fi
+                ;;
+        esac
+        exit
+    fi
+
+    t_$TARGET "$MUNIN_ARG"
+}
+
+parse_arcstats() {
+    if [ ! -e "$ARCSTATS_PATH" ]; then
+        return
+    fi
+
+    while read kstat_name kstat_type kstat_data
+    do
+        [[ $kstat_name =~ ^[0-9].* ]] && continue
+        [[ $kstat_name == "name" ]] && continue
+        [[ -z $kstat_name ]] && continue
+
+        ARCSTATS[$kstat_name]="$kstat_data"
+    done < "$ARCSTATS_PATH"
+}
+
+function bash_arr_join { local IFS="$1"; shift; echo "$*"; }
+
+hash_fieldname() {
+    # munin-2.0.28 workaround
+    # too much bug in munin about long fieldname
+    printf h
+    echo $1 | md5sum | cut -c-8
+}
+
+echo_arcstat_value() {
+    fieldname=$(hash_fieldname $1)
+    echo "$fieldname".value ${ARCSTATS["$1"]}
+}
+
+echo_total_pct_cdef() {
+    echo "$1,100,*,$2,/"
+}
+echo_portion_pct_cdef() {
+    echo "$1,100,*,$1,$2,+,/"
+}
+
+echo_hidden_derive_field() {
+    echo "$1.label $2"
+    echo "$1.type DERIVE"
+    echo "$1.min 0"
+    echo "$1.graph no"
+}
+
+tr_field() {
+    # cap first letter
+    echo $@ | sed 's/_/ /g' | sed -e "s/arc/ARC/" | sed -e "s/mfu/MFU/" | sed -e "s/mru/MRU/" | sed -e "s/\b\(.\)/\u\1/g"
+}
+
+map_field_label() {
+    case "$1" in
+        size) echo actual total arc size ;;
+        p) echo target size of MRU ;;
+        c) echo target size of cache ;;
+        c_min) echo min target cache size ;;
+        c_max) echo max target cache size ;;
+        meta_limit) echo max size for metadata ;;
+        meta_min) echo min size for metadata ;;
+        meta_used) echo size of metadata ;;
+        meta_max) echo max size of metadata ;;
+        dbuf_metadata) echo dnode metadata ;;
+        bonus_size) echo bonus buffer metadata ;;
+
+        mfu_size) echo MFU size ;;
+        mru_size) echo MRU size ;;
+
+        *) echo $(tr_field $1) ;;
+    esac
+}
+
+set_munin_pct_graph() {
+    echo 'graph_args --lower-limit 0 --upper-limit 100 --rigid'
+    echo 'graph_vlabel %'
+    echo 'graph_scale no'
+
+}
+set_munin_cnt_graph() {
+    echo 'graph_args --lower-limit 0'
+}
+
+t_efficiency_pct() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Efficiency by ratio'
+        echo 'graph_info This graph shows the ARC Efficiency'
+        echo 'graph_category test'
+        set_munin_pct_graph
+
+    fi
+
+    echo_aggre_data pct "type" ALL "$1"
+
+    if [ "$1" = "config" ]; then
+        echo_hidden_derive_field $(hash_fieldname mfu_hits) mfu_hits
+        echo_hidden_derive_field $(hash_fieldname mru_hits) mru_hits
+
+        real_hits_pct_fieldname=$(hash_fieldname real_hits_pct)
+        hits_fieldname=$(hash_fieldname hits)
+        misses_fieldname=$(hash_fieldname misses)
+        mfu_fieldname=$(hash_fieldname mfu_hits)
+        mru_fieldname=$(hash_fieldname mru_hits)
+
+        echo $real_hits_pct_fieldname'.label Actual Hit Ratio'
+        echo $real_hits_pct_fieldname".cdef $mfu_fieldname,$mru_fieldname,+,100,*,$hits_fieldname,$misses_fieldname,+,/"
+    else
+        echo_arcstat_value mfu_hits
+        echo_arcstat_value mru_hits
+        real_hits_pct_fieldname=$(hash_fieldname real_hits_pct)
+        echo $real_hits_pct_fieldname'.value U'
+    fi
+}
+
+t_efficiency_cnt() {
+
+    # I original wanna write this one like if_ series,
+    # use {fieldname}.negative to visualize hits/misses,
+    # unfortunatelly, there are just too many bug in munin 2.0.28 aroud it.
+
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Efficiency by access'
+        echo 'graph_category test'
+        set_munin_cnt_graph
+    fi
+    echo_aggre_data cnt "type" ALL "$1"
+}
+
+t_hits_bylist_pct() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Hits pct by list'
+        echo 'graph_category test'
+        set_munin_pct_graph
+    fi
+    echo_aggre_data pct list hits "$1"
+    if [ "$1" = "config" ]; then
+        total_hits_fieldname=$(hash_fieldname hits)
+        k=()
+        for i in "${t_kstat_name_prefix[@]}"
+        do
+            [[ -z $i ]] && continue
+            k+=($(hash_fieldname "$i"hits)",-")
+        done
+
+        anonymous_hits_pct_fieldname=$(hash_fieldname anonymous_hits_pct_fieldname)
+
+        echo $anonymous_hits_pct_fieldname'.label Anonymous Hits pct'
+        echo $anonymous_hits_pct_fieldname'.draw AREASTACK'
+        echo $anonymous_hits_pct_fieldname".cdef $total_hits_fieldname,$(bash_arr_join "," ${k[@]}),100,*,$total_hits_fieldname,/"
+    else
+        anonymous_hits_pct_fieldname=$(hash_fieldname anonymous_hits_pct_fieldname)
+        echo $anonymous_hits_pct_fieldname'.value U'
+    fi
+}
+
+echo_aggre_data() {
+    func1=$1
+    rang1=$2
+    rang2=$3
+    func2=$4
+
+    case "$rang1" in
+        "type")
+            t_kstat_name_prefix=("" "demand_data_" "demand_metadata_" "prefetch_data_" "prefetch_metadata_")
+            ;;
+        "list")
+            t_kstat_name_prefix=("" "mfu_" "mru_" "mfu_ghost_" "mru_ghost_")
+            ;;
+    esac
+
+    if [ "$rang2" = "ALL" ]; then
+        hma=("hits" "misses")
+    else
+        hma=("$rang2")
+    fi
+
+    for i in "${t_kstat_name_prefix[@]}"
+    do
+        [[ "$func1" = "cnt" ]] && [[ -z $i ]] && continue
+
+        for j in "${hma[@]}"
+        do
+            if [ "$func2" = "config" ]; then
+
+                fieldname=$(hash_fieldname "$i""$j")
+
+                echo $fieldname".label" "$(tr_field "$i""$j") cnt"
+                echo $fieldname".type DERIVE"
+                echo $fieldname".min 0"
+
+                [[ "$func1" = "cnt" ]] && echo $fieldname".draw AREASTACK"
+                [[ "$func1" = "pct" ]] && echo $fieldname".graph no"
+            else
+                echo_arcstat_value "$i""$j"
+            fi
+        done
+        if [ "$func1" = "pct" ]; then
+            if [ "$rang2" = "ALL" ]; then
+                hit_fieldname=$(hash_fieldname "$i"hits)
+                miss_fieldname=$(hash_fieldname "$i"misses)
+                hit_pct_fieldname=$(hash_fieldname "$i"hits_pct)
+                if [ "$func2" = "config" ]; then
+                    echo $hit_pct_fieldname.label "$(tr_field $i)Efficiency"
+                    echo $hit_pct_fieldname.cdef $(echo_portion_pct_cdef $hit_fieldname $miss_fieldname)
+                else
+                    echo $hit_pct_fieldname.value U
+                fi
+            fi
+
+            [[ -z $i ]] && continue
+
+            if [ "$rang2" = "hits" ]; then
+                hit_fieldname=$(hash_fieldname "$i"hits)
+                total_hits_fieldname=$(hash_fieldname hits)
+
+                hit_pct_fieldname=$(hash_fieldname "$i"hits_pct)
+
+                if [ "$func2" = "config" ]; then
+                    echo $hit_pct_fieldname.label "$(tr_field $i)Hits pct"
+                    echo $hit_pct_fieldname.draw AREASTACK
+                    echo $hit_pct_fieldname.cdef $(echo_total_pct_cdef $hit_fieldname $total_hits_fieldname)
+                else
+                    echo $hit_pct_fieldname.value U
+                fi
+            fi
+            if [ "$rang2" = "misses" ]; then
+                miss_fieldname=$(hash_fieldname "$i"misses)
+                total_misses_fieldname=$(hash_fieldname misses)
+
+                miss_pct_fieldname=$(hash_fieldname "$i"misses_pct)
+
+                if [ "$func2" = "config" ]; then
+                    echo $miss_pct_fieldname.label "$(tr_field $i)Misses pct"
+                    echo $miss_pct_fieldname.draw AREASTACK
+                    echo $miss_pct_fieldname.cdef $(echo_total_pct_cdef $miss_fieldname $total_misses_fieldname)
+                else
+                    echo $miss_pct_fieldname.value U
+                fi
+            fi
+        fi
+    done
+}
+
+t_hits_bylist_cnt() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Hits cnt by list'
+        echo 'graph_category test'
+        set_munin_cnt_graph
+    fi
+
+    echo_aggre_data cnt list hits "$1"
+
+    if [ "$1" = "config" ]; then
+        k=()
+        for i in "${t_kstat_name_prefix[@]}"
+        do
+            [[ -z $i ]] && continue
+            k+=($(hash_fieldname "$i"hits)",-")
+        done
+
+        echo_hidden_derive_field $(hash_fieldname hits) hits
+
+        total_hits_fieldname=$(hash_fieldname hits)
+        anonymous_hits_fieldname=$(hash_fieldname anonymous_hits_fieldname)
+
+        echo $anonymous_hits_fieldname'.label Anonymous Hits cnt'
+        echo $anonymous_hits_fieldname'.type DERIVE'
+        echo $anonymous_hits_fieldname'.min 0'
+        echo $anonymous_hits_fieldname'.draw AREASTACK'
+        echo $anonymous_hits_fieldname".cdef $total_hits_fieldname,$(bash_arr_join "," ${k[@]})"
+    else
+        echo_arcstat_value hits
+        anonymous_hits_fieldname=$(hash_fieldname anonymous_hits_fieldname)
+        echo $anonymous_hits_fieldname'.value U'
+    fi
+}
+
+t_hits_bytype_pct() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Hits pct by type'
+        echo 'graph_category test'
+        set_munin_pct_graph
+    fi
+    echo_aggre_data pct "type" hits "$1"
+}
+t_hits_bytype_cnt() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Hits cnt by type'
+        echo 'graph_category test'
+        set_munin_cnt_graph
+    fi
+    echo_aggre_data cnt "type" hits "$1"
+}
+t_misses_bytype_pct() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Misses pct by type'
+        echo 'graph_category test'
+        set_munin_pct_graph
+    fi
+    echo_aggre_data pct "type" misses "$1"
+}
+t_misses_bytype_cnt() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Misses cnt by type'
+        echo 'graph_category test'
+        set_munin_cnt_graph
+    fi
+    echo_aggre_data cnt "type" misses "$1"
+}
+
+t_arc_size() {
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Size'
+        echo 'graph_args --lower-limit 0 --base 1024'
+#        echo graph_order $(hash_fieldname c_max) $(hash_fieldname c_min) $(hash_fieldname c) $(hash_fieldname size) $(hash_fieldname p) $(hash_fieldname mru_size)
+
+        echo 'graph_category test'
+
+        fieldname=$(hash_fieldname size)
+        echo $fieldname.label Cache Size
+        echo $fieldname.min 0
+        echo $fieldname.draw AREA
+
+        fieldname=$(hash_fieldname mru_size)
+        echo $fieldname.label MRU Size
+        echo $fieldname.min 0
+        echo $fieldname.draw AREASTACK
+
+        fieldname=$(hash_fieldname mfu_size)
+        echo $fieldname.label MFU Size
+        echo $fieldname.min 0
+        echo $fieldname.draw AREASTACK
+
+        fieldname=$(hash_fieldname c_min)
+        echo $fieldname.label Min ARC Size
+        echo $fieldname.min 0
+
+        fieldname=$(hash_fieldname c_max)
+        echo $fieldname.label Max ARC Size
+        echo $fieldname.min 0
+
+        fieldname=$(hash_fieldname c)
+        echo $fieldname.label Target Cache Size
+        echo $fieldname.min 0
+
+        fieldname=$(hash_fieldname p)
+        echo $fieldname.label Target MRU Size
+        echo $fieldname.min 0
+
+    else
+        echo_arcstat_value size
+        echo_arcstat_value mru_size
+        echo_arcstat_value mfu_size
+        echo_arcstat_value c_min
+        echo_arcstat_value c_max
+        echo_arcstat_value c
+        echo_arcstat_value p
+    fi
+}
+
+t_arc_size_breakdown() {
+    t_kstat_name=(
+        "metadata_size"
+        "bonus_size"
+        "dnode_size"
+        "dbuf_size"
+        "hdr_size"
+        "l2_hdr_size"
+        "data_size"
+    )
+    t_kstat_name_line=(
+        "arc_meta_max"
+        "arc_meta_min"
+        "arc_meta_used"
+        "arc_meta_limit"
+        "c"
+        "c_min"
+        "c_max"
+        "size"
+    )
+
+    if [ "$1" = "config" ]; then
+        echo 'graph_title ZFS ARC Size Breakdown'
+        echo 'graph_args --lower-limit 0 --base 1024'
+
+        echo 'graph_category test'
+
+        for i in "${t_kstat_name[@]}"
+        do
+            fieldname=$(hash_fieldname $i)
+            echo $fieldname.label $(tr_field $i)
+            echo $fieldname.draw AREASTACK
+            echo $fieldname.min 0
+        done
+        for i in "${t_kstat_name_line[@]}"
+        do
+            fieldname=$(hash_fieldname $i)
+            echo $fieldname.label $(tr_field $i)
+            echo $fieldname.min 0
+        done
+    else
+        for i in "${t_kstat_name[@]}"
+        do
+            echo_arcstat_value $i
+        done
+        for i in "${t_kstat_name_line[@]}"
+        do
+            echo_arcstat_value $i
+        done
+    fi
+}
+
+main "$@"
+
